@@ -97,7 +97,7 @@ impl<T, V> ShardCollection<T, V> {
         }
     }
 
-    /// Push an `item` of type [`V`] into a bucket (round-robin distribution)
+    /// Push an `item` of type [`V`] into a shard (round-robin distribution)
     pub fn push(&self, item: V) {
         if self.shards.is_empty() {
             return;
@@ -107,7 +107,7 @@ impl<T, V> ShardCollection<T, V> {
     }
 
     /// Returns a reference to a [`Shard`] at `idx`
-    pub fn get_bucket(&self, idx: usize) -> Option<&Shard<T, V>> {
+    pub fn get_shard(&self, idx: usize) -> Option<&Shard<T, V>> {
         self.shards.get(idx)
     }
 
