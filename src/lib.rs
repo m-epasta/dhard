@@ -2,25 +2,36 @@ use std::{
     error::Error,
     io::{Read, Write},
     marker::PhantomData,
+    sync::atomic::{AtomicUsize, Ordering},
 };
 
 use parking_lot::{RwLock, RwLockReadGuard, RwLockWriteGuard};
 
-/// Data structure for sharding your `T` into
-/// a collection of items `V`
-/// NOTE: items are thread safe because of a [`parking_lot::RwLock`] wrapper
+/// A collection of [`Shard`]s that distributes items across multiple shards
+pub struct ShardCollection<T, V> {
+    shards: Vec<Shard<T, V>>,
+    counter: AtomicUsize,
+    _marker: PhantomData<T>,
+}
+
+/// A single shard containing items `V` behind a [`parking_lot::RwLock`]
 pub struct Shard<T, V> {
     items: RwLock<Vec<V>>,
     _marker: PhantomData<T>,
 }
 
+/// Container over a [`RwLockReadGuard`] Vec<V> (which is items in [`Shard`]),
+/// It also keeps a index to retrieve a reference over `self.items[idx]`
 pub struct ShardRef<'a, V> {
     guard: RwLockReadGuard<'a, Vec<V>>,
     idx: usize,
 }
 
+/// Container over a [`RwLockWriteGuard`] Vec<V> (which is items in [`Shard`]),
+/// It also keeps a index to retrieve a mutable reference over `self.items[idx]`
+/// NOTE: [`RwLockWriteGuard`] locks the whole `Vec` because we take a write lock
 pub struct ShardMutRef<'a, V> {
-    guard: RwLockWriteGuard<'a, Vec<V>>,
+    guard: Option<RwLockWriteGuard<'a, Vec<V>>>,
     idx: usize,
 }
 
@@ -51,7 +62,7 @@ pub struct ShardReader<R: Read, T, D, E: Error> {
 /// the sharding logic of your Shard<YourType>. The only constraint
 /// is that you have to collect the shards as `Vec<V>`
 pub trait ShardExt<T, V> {
-    fn shard(data: &T) -> Shard<T, V>;
+    fn shard(data: &T) -> ShardCollection<T, V>;
 }
 
 /// This trait permits you to implement a general write logic to any Write compatible type
@@ -67,6 +78,59 @@ pub trait Readable: Sized {
     type Error;
 
     fn read_from<R: Read>(reader: &mut R) -> Result<Self, Self::Error>;
+}
+
+/// This trait permits you to validate via [`Writable`] and [`Readable`] the possibility
+/// of writing to file your shards. Do prefer this trait for writing and reading your shards
+pub trait ShardFormat<W: Write, T, D, E: Error> {
+    fn write_shard<V: Writable>(&mut self, shard: &Shard<T, V>) -> Result<(), E>;
+    fn read_shard<V: Readable>(&mut self) -> Result<Shard<T, V>, E>;
+}
+
+impl<T, V> ShardCollection<T, V> {
+    /// Creates a new [`ShardCollection`] with `num_shards` empty shards
+    pub fn new(num_shards: usize) -> Self {
+        Self {
+            shards: (0..num_shards).map(|_| Shard::new()).collect(),
+            counter: AtomicUsize::new(0),
+            _marker: PhantomData,
+        }
+    }
+
+    /// Push an `item` of type [`V`] into a bucket (round-robin distribution)
+    pub fn push(&self, item: V) {
+        if self.shards.is_empty() {
+            return;
+        }
+        let idx = self.counter.fetch_add(1, Ordering::Relaxed) % self.shards.len();
+        self.shards[idx].push(item);
+    }
+
+    /// Returns a reference to a [`Shard`] at `idx`
+    pub fn get_bucket(&self, idx: usize) -> Option<&Shard<T, V>> {
+        self.shards.get(idx)
+    }
+
+    /// Returns the number of shards
+    pub fn num_shards(&self) -> usize {
+        self.shards.len()
+    }
+
+    /// Return the total number of items across all shards
+    pub fn len(&self) -> usize {
+        self.shards.iter().map(|b| b.len()).sum()
+    }
+
+    /// Returns whether or not all shards are empty
+    pub fn is_empty(&self) -> bool {
+        self.shards.iter().all(|b| b.is_empty())
+    }
+}
+
+impl<T, V> Default for ShardCollection<T, V> {
+    fn default() -> Self {
+        Self::new(1)
+    }
 }
 
 impl<T, V> Shard<T, V> {
@@ -153,6 +217,7 @@ impl<'a, V> ShardRef<'a, V> {
         }
     }
 
+    /// Returns a reference over the item in `items[self.idx]`
     pub fn get_ref(&self) -> &V {
         &self.guard[self.idx]
     }
@@ -161,25 +226,30 @@ impl<'a, V> ShardRef<'a, V> {
 impl<'a, V> ShardMutRef<'a, V> {
     fn new(guard: RwLockWriteGuard<'a, Vec<V>>, idx: usize) -> Option<Self> {
         if idx < guard.len() {
-            Some(Self { guard, idx })
+            Some(Self {
+                guard: Some(guard),
+                idx,
+            })
         } else {
             None
         }
     }
 
+    /// Returns a mutable reference over the item in `items[self.idx]`
     /// NOTE: This method uses a [`RwLockWriteGuard`] which blocks reads and write
     /// during the access of the mutable reference to the `V` item
     pub fn get_mut_ref(&mut self) -> &mut V {
-        &mut self.guard[self.idx]
+        &mut self.guard.as_mut().expect("lock already released")[self.idx]
+    }
+
+    /// Releases the write lock early, allowing other threads to read/write
+    /// NOTE: After calling this, [`get_mut_ref`] will panic
+    pub fn release_lock(&mut self) {
+        self.guard.take();
     }
 }
 
-/// This trait permits you to validate via [`Writable`] and [`Readable`] the possibility
-/// of writing to file your shards. Do prefer this trait for writing and reading your shards
-pub trait ShardFormat<W: Write, T, D, E: Error> {
-    fn write_shard<V: Writable>(&mut self, shard: &Shard<T, V>) -> Result<(), E>;
-    fn read_shard<V: Readable>(&mut self) -> Result<Shard<T, V>, E>;
-}
-
 #[cfg(test)]
-mod tests;
+mod integration_tests;
+#[cfg(test)]
+mod unit_tests;
