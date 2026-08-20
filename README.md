@@ -27,4 +27,7 @@ To learn more about the library, you can check the [docs](https://docs.rs/dhard/
 ## LICENSE
 
 Dhard is licensed as MIT or APACHE 2.0, you will find the licenses
-in current working directory.
+at:
+
+- [MIT LICENSE](./LICENSE-MIT)
+- [APACHE 2.0 LICENSE](./LICENSE-APACHE)
