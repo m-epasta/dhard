@@ -10,7 +10,7 @@ use parking_lot::{RwLock, RwLockReadGuard, RwLockWriteGuard};
 /// a collection of items `V`
 /// NOTE: items are thread safe because of a [`parking_lot::RwLock`] wrapper
 pub struct Shard<T, V> {
-    pub items: RwLock<Vec<V>>,
+    items: RwLock<Vec<V>>,
     _marker: PhantomData<T>,
 }
 
