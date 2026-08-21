@@ -1,10 +1,9 @@
 [package]
 name = "dhard"
-description = "DHARD - Data structure for writing shard that persists on disk"
+description = "DHARD - Data structure for writing shards that persist on disk"
 license = "MIT OR APACHE-2.0"
 version = "0.1.0"
 edition = "2024"
-
 documentation = "https://docs.rs/dhard"
 repository = "https://github.com/m-epasta/dhard"
 
