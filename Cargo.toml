@@ -9,4 +9,21 @@ documentation = "https://docs.rs/dhard"
 repository = "https://github.com/m-epasta/dhard"
 
 [dependencies]
+crossbeam-utils = "0.8"
 parking_lot = "0.12.5"
+
+[dev-dependencies]
+criterion = "0.8"
+dashmap = "6"
+
+[[bench]]
+name = "shard"
+harness = false
+
+[[bench]]
+name = "map"
+harness = false
+
+[[bench]]
+name = "throughput"
+harness = false
