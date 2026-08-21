@@ -4,13 +4,10 @@ use std::collections::HashMap;
 
 use crate::{ShardCollection, ShardExt};
 
-struct _RwShardedHashMap;
+type RwShardedHashMap<T> = ShardCollection<HashMap<T, T>>;
 
-type RwShardedHashMap<T> = ShardCollection<_RwShardedHashMap, HashMap<T, T>>;
-
-// Based on the size of the Hashamp we will divide it to have more likely maximum 32 entries per Shard
-impl<T, V> ShardExt<T, V> for RwShardedHashMap<T> {
-    fn shard(data: &T) -> ShardCollection<T, V> {
+impl<T> ShardExt<HashMap<T, T>> for RwShardedHashMap<T> {
+    fn shard(data: &HashMap<T, T>) -> ShardCollection<HashMap<T, T>> {
         todo!()
     }
 }

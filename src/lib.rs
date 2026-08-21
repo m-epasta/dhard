@@ -8,26 +8,25 @@ use std::{
 use parking_lot::{RwLock, RwLockReadGuard, RwLockWriteGuard};
 
 /// A collection of [`Shard`]s that distributes items across multiple shards
-pub struct ShardCollection<T, V> {
-    shards: Vec<Shard<T, V>>,
-    counter: AtomicUsize,
-    _marker: PhantomData<T>,
+pub struct ShardCollection<V> {
+    shards: Vec<Shard<V>>,
+    rr_counter: AtomicUsize,
 }
 
 /// A single shard containing items `V` behind a [`parking_lot::RwLock`]
-pub struct Shard<T, V> {
+pub struct Shard<V> {
     items: RwLock<Vec<V>>,
-    _marker: PhantomData<T>,
+    items_count: AtomicUsize,
 }
 
-/// Container over a [`RwLockReadGuard`] Vec<V> (which is items in [`Shard`]),
+/// Container over a [`RwLockReadGuard`] `Vec<V>` (which is items in [`Shard`]),
 /// It also keeps a index to retrieve a reference over `self.items[idx]`
 pub struct ShardRef<'a, V> {
     guard: RwLockReadGuard<'a, Vec<V>>,
     idx: usize,
 }
 
-/// Container over a [`RwLockWriteGuard`] Vec<V> (which is items in [`Shard`]),
+/// Container over a [`RwLockWriteGuard`] `Vec<V>` (which is items in [`Shard`]),
 /// It also keeps a index to retrieve a mutable reference over `self.items[idx]`
 /// NOTE: [`RwLockWriteGuard`] locks the whole `Vec` because we take a write lock
 pub struct ShardMutRef<'a, V> {
@@ -35,38 +34,36 @@ pub struct ShardMutRef<'a, V> {
     idx: usize,
 }
 
-/// [`ShardWriter`] is a public interface for writing to disk your `Shard<T>`
+/// [`ShardWriter`] is a public interface for writing to disk your [`Shard`]s
 #[allow(dead_code)]
-pub struct ShardWriter<W: Write, T, D, E: Error> {
+pub struct ShardWriter<W, D, E> {
     writer: W,
     data_size: u64,
     data: D,
     checksum: u64,
-    _marker: PhantomData<T>,
-    _e: E,
+    _e: PhantomData<E>,
 }
 
-/// [`ShardWriter`] is a public interface for reading
-/// your `Shard<T>` that has been written witth [`ShardWriter`] to disk
+/// [`ShardReader`] is a public interface for reading
+/// your [`Shard`]s that have been written with [`ShardWriter`] to disk
 #[allow(dead_code)]
-pub struct ShardReader<R: Read, T, D, E: Error> {
+pub struct ShardReader<R, D, E> {
     reader: R,
     data_size: u64,
     data: D,
     checksum: u64,
-    _marker: PhantomData<T>,
-    _e: E,
+    _e: PhantomData<E>,
 }
 
 /// [`ShardExt`] is a public interface where you can define
-/// the sharding logic of your Shard<YourType>. The only constraint
-/// is that you have to collect the shards as `Vec<V>`
-pub trait ShardExt<T, V> {
-    fn shard(data: &T) -> ShardCollection<T, V>;
+/// the sharding logic of your `Shard<YourType>`. The only constraint
+/// is that you have to collect the shards into a [`ShardCollection`]
+pub trait ShardExt<V> {
+    fn shard(data: &V) -> ShardCollection<V>;
 }
 
-/// This trait permits you to implement a general write logic to any Write compatible type
-/// (so a type that can convert into &[u8])
+/// This trait permits you to implement a general write logic into any [`std::io::Write`] sink
+/// (files, sockets, buffers, ...)
 pub trait Writable {
     type Error;
 
@@ -82,32 +79,33 @@ pub trait Readable: Sized {
 
 /// This trait permits you to validate via [`Writable`] and [`Readable`] the possibility
 /// of writing to file your shards. Do prefer this trait for writing and reading your shards
-pub trait ShardFormat<W: Write, T, D, E: Error> {
-    fn write_shard<V: Writable>(&mut self, shard: &Shard<T, V>) -> Result<(), E>;
-    fn read_shard<V: Readable>(&mut self) -> Result<Shard<T, V>, E>;
+pub trait ShardFormat<W: Write, D, E: Error> {
+    fn write_shard<V: Writable<Error = E>>(&mut self, shard: &Shard<V>) -> Result<(), E>;
+    fn read_shard<V: Readable<Error = E>>(&mut self) -> Result<Shard<V>, E>;
 }
 
-impl<T, V> ShardCollection<T, V> {
+impl<V> ShardCollection<V> {
     /// Creates a new [`ShardCollection`] with `num_shards` empty shards
     pub fn new(num_shards: usize) -> Self {
         Self {
             shards: (0..num_shards).map(|_| Shard::new()).collect(),
-            counter: AtomicUsize::new(0),
-            _marker: PhantomData,
+            rr_counter: AtomicUsize::new(0),
         }
     }
 
-    /// Push an `item` of type [`V`] into a shard (round-robin distribution)
-    pub fn push(&self, item: V) {
+    /// Push an `item` of type `V` into a shard (round-robin distribution) and returns the index
+    /// of which shard was written and the index of the item in the inner vector of items
+    pub fn push(&self, item: V) -> Option<(usize, usize)> {
         if self.shards.is_empty() {
-            return;
+            return None;
         }
-        let idx = self.counter.fetch_add(1, Ordering::Relaxed) % self.shards.len();
-        self.shards[idx].push(item);
+        let shard_idx = self.rr_counter.fetch_add(1, Ordering::Relaxed) % self.shards.len();
+        let item_idx = self.shards[shard_idx].push(item);
+        Some((shard_idx, item_idx))
     }
 
     /// Returns a reference to a [`Shard`] at `idx`
-    pub fn get_shard(&self, idx: usize) -> Option<&Shard<T, V>> {
+    pub fn get_shard(&self, idx: usize) -> Option<&Shard<V>> {
         self.shards.get(idx)
     }
 
@@ -127,27 +125,30 @@ impl<T, V> ShardCollection<T, V> {
     }
 }
 
-impl<T, V> Default for ShardCollection<T, V> {
+impl<V> Default for ShardCollection<V> {
     fn default() -> Self {
         Self::new(1)
     }
 }
 
-impl<T, V> Shard<T, V> {
+impl<V> Shard<V> {
     /// Creates a new [`Shard`]
     pub fn new() -> Self {
         Self {
             items: RwLock::new(vec![]),
-            _marker: PhantomData,
+            items_count: AtomicUsize::new(0),
         }
     }
 
-    /// Push an `item` of type [`V`] into `self.items`
-    pub fn push(&self, item: V) {
-        self.items.write().push(item);
+    /// Push an `item` of type `V` into `self.items` and returns the length of `self.items`
+    pub fn push(&self, item: V) -> usize {
+        let mut items = self.items.write();
+        items.push(item);
+        self.items_count.fetch_add(1, Ordering::Relaxed);
+        items.len() - 1
     }
 
-    /// Returns a [`RwLockReadGuard`] over a Vec of items [`V`]
+    /// Returns a [`RwLockReadGuard`] over a Vec of items `V`
     /// To have a clean `&[V]` type you have to reference the result of this function such as:
     /// ```ignore
     /// let guard = my_shard.items();
@@ -157,7 +158,7 @@ impl<T, V> Shard<T, V> {
     /// let items = &guard[..];
     /// let items: &[V] = &*guard;
     /// ```
-    /// To learn more, go read [parking_lot documentation](https://docs.rs/parking_lot/0.12.5/parking_lot/type.RwLockReadGuard.html)
+    /// To learn more, go read [`parking_lot documentation`](https://docs.rs/parking_lot/0.12.5/parking_lot/type.RwLockReadGuard.html)
     pub fn items(&self) -> RwLockReadGuard<'_, Vec<V>> {
         self.items.read()
     }
@@ -193,16 +194,16 @@ impl<T, V> Shard<T, V> {
 
     /// Return the number of `items` in self
     pub fn len(&self) -> usize {
-        self.items.read().len()
+        self.items_count.load(Ordering::Relaxed)
     }
 
     /// Returns wheter or not `items` is empty
     pub fn is_empty(&self) -> bool {
-        self.items.read().is_empty()
+        self.items_count.load(Ordering::Relaxed) == 0
     }
 }
 
-impl<T, V> Default for Shard<T, V> {
+impl<V> Default for Shard<V> {
     fn default() -> Self {
         Self::new()
     }
@@ -243,7 +244,7 @@ impl<'a, V> ShardMutRef<'a, V> {
     }
 
     /// Releases the write lock early, allowing other threads to read/write
-    /// NOTE: After calling this, [`get_mut_ref`] will panic
+    /// NOTE: After calling this, [`ShardMutRef::get_mut_ref`] will panic
     pub fn release_lock(&mut self) {
         self.guard.take();
     }

@@ -6,9 +6,7 @@ struct TestData {
     name: String,
 }
 
-struct Test;
-
-type TestShard = Shard<Test, TestData>;
+type TestShard = Shard<TestData>;
 
 fn make_item(id: u32, name: &str) -> TestData {
     TestData {
@@ -217,7 +215,7 @@ fn test_empty_shard_operations() {
 
 #[test]
 fn test_shard_with_primitive_types() {
-    let shard: Shard<Test, i32> = Shard::new();
+    let shard: Shard<i32> = Shard::new();
     shard.push(1);
     shard.push(2);
     shard.push(3);
@@ -229,7 +227,7 @@ fn test_shard_with_primitive_types() {
 
 #[test]
 fn test_shard_with_string() {
-    let shard: Shard<Test, String> = Shard::new();
+    let shard: Shard<String> = Shard::new();
     shard.push("hello".to_string());
     shard.push("world".to_string());
 
@@ -239,7 +237,7 @@ fn test_shard_with_string() {
 
 #[test]
 fn test_shard_with_option() {
-    let shard: Shard<Test, Option<i32>> = Shard::new();
+    let shard: Shard<Option<i32>> = Shard::new();
     shard.push(Some(1));
     shard.push(None);
     shard.push(Some(3));
