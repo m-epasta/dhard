@@ -21,7 +21,7 @@ jobs:
         just-version: 1.58.0
 
     - name: clippy
-      run: just clippy
+      run: just cl
 
     - name: build
       run: cargo build --release
