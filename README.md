@@ -11,8 +11,8 @@ The library is shipped with 2 layers:
 
 - **Sharding primitives**:  `ShardCollection` distributes items round-robin across
   cache-line-padded shards, each guarding its own items behind a `parking_lot` RwLock;
-- **Concurrent data structures**:  a keyed hashmap, a read/delete-optimized map and a
-  handle-based slot map, all built on the same sharding pattern.
+- **Concurrent data structures**: a read/delete-optimized map and a
+  slot map, all built on the same sharding pattern.
 - (unimplemented) IO persisting shards: primitives for writing and reading to/from
 file shards
 
@@ -76,23 +76,20 @@ assert!(shards.num_shards() > 1);
 
 ## Concurrent data structures
 
-- **`RwShardedHashMap`**:  balanced keyed default: each shard wraps a SwissTable
-  `std::collections::HashMap` behind a cache-padded RwLock. Best for write-heavy or
-  mixed keyed workloads.
 - **`RwShardedDlhtMap`**:  read/delete specialist: fingerprints in cache-line-chained
   bins point into a side arena, hashing each key once. Fastest keyed lookups and
   removals, at the cost of roughly half-speed inserts.
 - **`RwShardedSlotMap`**:  mints stable `SlotKey` handles at insert time
-  (shard + slot + generation): O(1) lookups and removals without any hashing, provided
-  deletions can present the stored handle rather than an arbitrary key.
+  (shard + generational slot, backed by `slotmap` arenas): O(1) lookups and removals
+  without any hashing, provided deletions can present the stored handle rather than an
+  arbitrary key.
 
 | You need | Use |
 | --- | --- |
-| Keyed access, write-heavy or balanced | `RwShardedHashMap` |
-| Keyed access, read/delete-heavy | `RwShardedDlhtMap` |
+| Keyed access, not heavy workload | `RwShardedDlhtMap` |
 | Stable handles, O(1) remove, zero hashing | `RwShardedSlotMap` |
 | Maximum raw append throughput | `ShardCollection` |
-| Single-threaded keyed storage | `std::collections::HashMap` |
+| Single-threaded keyed storage | `slotmap::SlotMap` |
 
 To learn more about the library, you can check the [docs](https://docs.rs/dhard)
 

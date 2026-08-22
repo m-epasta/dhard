@@ -75,28 +75,25 @@
 //! sharding pattern — each occupies a different point of the trade-off space, and all
 //! are covered by the benchmark suite (`cargo bench --bench throughput`):
 //!
-//! - [`RwShardedHashMap`] is the balanced keyed default: each shard wraps a SwissTable
-//!   `std::collections::HashMap` behind a cache-padded [`parking_lot::RwLock`]. Best
-//!   for write-heavy or mixed keyed workloads.
 //! - [`RwShardedDlhtMap`] is the read/delete specialist: fingerprints in cache-line-
 //!   chained bins point into a side arena, hashing each key once and touching a single
 //!   cache line on most lookups. Fastest keyed lookups and removals, at the cost of
 //!   roughly half-speed inserts. Design inspired by DLHT (HPDC'24,
 //!   <https://arxiv.org/abs/2406.09986>).
 //! - [`RwShardedSlotMap`] mints stable [`SlotKey`] handles at insert time
-//!   (shard + slot + generation): O(1) lookups and removals without any hashing, and
+//!   (shard + generational slot): O(1) lookups and removals without any hashing, and
 //!   the fastest structure in the crate overall — provided deletions can present the
-//!   stored handle rather than an arbitrary key.
+//!   stored handle rather than an arbitrary key. Each shard is a battle-tested
+//!   [`slotmap`](https://docs.rs/slotmap) arena.
 //!
 //! ## Choosing a structure
 //!
 //! | You need | Use |
 //! |---|---|
-//! | Keyed access, write-heavy or balanced | [`RwShardedHashMap`] |
-//! | Keyed access, read/delete-heavy | [`RwShardedDlhtMap`] |
+//! | Keyed access, not heavy workload | [`RwShardedDlhtMap`] |
 //! | Stable handles, O(1) remove, zero hashing | [`RwShardedSlotMap`] |
 //! | Maximum raw append throughput | [`ShardCollection`] |
-//! | Single-threaded keyed storage | `std::collections::HashMap` |
+//! | Single-threaded keyed storage | `slotmap::SlotMap` |
 //!
 //! The sharded structures pay for their concurrency with per-operation locking:
 //! single-threaded code is better served by the standard library.
@@ -113,13 +110,11 @@ use crossbeam_utils::CachePadded;
 use parking_lot::{RwLock, RwLockReadGuard, RwLockWriteGuard};
 
 pub mod dlht_map;
-pub mod map;
 pub mod slot_map;
 
 mod hashing;
 
 pub use dlht_map::RwShardedDlhtMap;
-pub use map::RwShardedHashMap;
 pub use slot_map::{RwShardedSlotMap, SlotKey};
 
 /// A collection of [`Shard`]s that distributes items across multiple shards

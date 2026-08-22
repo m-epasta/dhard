@@ -7,20 +7,26 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use dashmap::DashMap;
-use dhard::{RwShardedDlhtMap, RwShardedHashMap, RwShardedSlotMap, ShardCollection};
+use dhard::{RwShardedDlhtMap, RwShardedSlotMap, ShardCollection, SlotKey};
+use slotmap::{DefaultKey, SlotMap};
 
 const TOTAL_OPS: usize = 10_000_000;
 const THREADS: usize = 8;
+const HEAVY_OPS: usize = 50_000_000;
 
 fn section(name: &str) {
     println!("\n=== {name} ===");
 }
 
 fn report(label: &str, elapsed: Duration) {
+    report_ops(label, elapsed, TOTAL_OPS);
+}
+
+fn report_ops(label: &str, elapsed: Duration, ops: usize) {
     println!(
         "{label}: {:.5}ms ({:.2} ops/sec)",
         elapsed.as_secs_f64() * 1000.0,
-        TOTAL_OPS as f64 / elapsed.as_secs_f64()
+        ops as f64 / elapsed.as_secs_f64()
     );
 }
 
@@ -28,56 +34,22 @@ fn report(label: &str, elapsed: Duration) {
 // Writes
 // ---------------------------------------------------------------------------
 
-fn bench_map_insert_single_threaded() {
-    let map = RwShardedHashMap::<usize, usize>::with_capacity(16, TOTAL_OPS);
-    let start = Instant::now();
-    for k in 0..TOTAL_OPS {
-        map.insert(k, k);
-    }
-    report("RwShardedHashMap[16] single-threaded insert", start.elapsed());
-}
-
-fn bench_map_insert_contended() {
-    let chunk = TOTAL_OPS / THREADS;
-    let map = Arc::new(RwShardedHashMap::<usize, usize>::with_capacity(
-        16,
-        TOTAL_OPS,
-    ));
-    let start = Instant::now();
-    let handles: Vec<_> = (0..THREADS)
-        .map(|t| {
-            let m = Arc::clone(&map);
-            thread::spawn(move || {
-                for i in 0..chunk {
-                    let k = t * chunk + i;
-                    m.insert(k, k);
-                }
-            })
-        })
-        .collect();
-    for h in handles {
-        h.join().unwrap();
-    }
-    report(
-        &format!("RwShardedHashMap[16] {THREADS}-thread contended insert"),
-        start.elapsed(),
-    );
-}
-
 fn bench_dlht_insert_single_threaded() {
     let map = RwShardedDlhtMap::<usize, usize>::with_capacity(16, TOTAL_OPS);
     let start = Instant::now();
     for k in 0..TOTAL_OPS {
         map.insert(k, k);
     }
-    report("RwShardedDlhtMap[16] single-threaded insert", start.elapsed());
+    report(
+        "RwShardedDlhtMap[16] single-threaded insert",
+        start.elapsed(),
+    );
 }
 
 fn bench_dlht_insert_contended() {
     let chunk = TOTAL_OPS / THREADS;
     let map = Arc::new(RwShardedDlhtMap::<usize, usize>::with_capacity(
-        16,
-        TOTAL_OPS,
+        16, TOTAL_OPS,
     ));
     let start = Instant::now();
     let handles: Vec<_> = (0..THREADS)
@@ -101,8 +73,7 @@ fn bench_dlht_insert_contended() {
 }
 
 fn bench_dashmap_insert_single_threaded() {
-    let map: DashMap<usize, usize> =
-        DashMap::with_capacity_and_shard_amount(TOTAL_OPS, 16);
+    let map: DashMap<usize, usize> = DashMap::with_capacity_and_shard_amount(TOTAL_OPS, 16);
     let start = Instant::now();
     for k in 0..TOTAL_OPS {
         map.insert(k, k);
@@ -141,7 +112,10 @@ fn bench_slotmap_insert_single_threaded() {
     for v in 0..TOTAL_OPS {
         let _ = map.insert(v);
     }
-    report("RwShardedSlotMap[16] single-threaded insert", start.elapsed());
+    report(
+        "RwShardedSlotMap[16] single-threaded insert",
+        start.elapsed(),
+    );
 }
 
 fn bench_slotmap_insert_contended() {
@@ -163,6 +137,39 @@ fn bench_slotmap_insert_contended() {
     }
     report(
         &format!("RwShardedSlotMap[16] {THREADS}-thread contended insert"),
+        start.elapsed(),
+    );
+}
+
+fn bench_std_slotmap_insert_single_threaded() {
+    let mut map = SlotMap::<DefaultKey, usize>::with_capacity(TOTAL_OPS);
+    let start = Instant::now();
+    for v in 0..TOTAL_OPS {
+        map.insert(v);
+    }
+    report("SlotMap[1] single-threaded insert", start.elapsed());
+}
+
+fn bench_std_slotmap_insert_contended() {
+    let chunk = TOTAL_OPS / THREADS;
+    let map: Arc<Mutex<SlotMap<DefaultKey, usize>>> =
+        Arc::new(Mutex::new(SlotMap::with_capacity(TOTAL_OPS)));
+    let start = Instant::now();
+    let handles: Vec<_> = (0..THREADS)
+        .map(|_| {
+            let m = Arc::clone(&map);
+            thread::spawn(move || {
+                for i in 0..chunk {
+                    m.lock().unwrap().insert(i);
+                }
+            })
+        })
+        .collect();
+    for h in handles {
+        h.join().unwrap();
+    }
+    report(
+        &format!("SlotMap[1] {THREADS}-thread contended insert"),
         start.elapsed(),
     );
 }
@@ -227,45 +234,10 @@ fn bench_mutex_hashmap_insert_contended() {
 // Reads
 // ---------------------------------------------------------------------------
 
-fn bench_map_get_contended() {
-    let chunk = TOTAL_OPS / THREADS;
-    let map = Arc::new(RwShardedHashMap::<usize, usize>::with_capacity(
-        16,
-        TOTAL_OPS,
-    ));
-    (0..TOTAL_OPS).for_each(|k| {
-        map.insert(k, k);
-    });
-
-    let start = Instant::now();
-    let handles: Vec<_> = (0..THREADS)
-        .map(|t| {
-            let m = Arc::clone(&map);
-            thread::spawn(move || {
-                let mut hits = 0usize;
-                for i in 0..chunk {
-                    if m.contains_key(&(i * (t + 1))) {
-                        hits += 1;
-                    }
-                }
-                hits
-            })
-        })
-        .collect();
-    for h in handles {
-        assert!(h.join().unwrap() > 0);
-    }
-    report(
-        &format!("RwShardedHashMap[16] {THREADS}-thread contended get"),
-        start.elapsed(),
-    );
-}
-
 fn bench_dlht_get_contended() {
     let chunk = TOTAL_OPS / THREADS;
     let map = Arc::new(RwShardedDlhtMap::<usize, usize>::with_capacity(
-        16,
-        TOTAL_OPS,
+        16, TOTAL_OPS,
     ));
     (0..TOTAL_OPS).for_each(|k| {
         map.insert(k, k);
@@ -358,45 +330,56 @@ fn bench_slotmap_get_contended() {
     );
 }
 
-// ---------------------------------------------------------------------------
-// Removals
-// ---------------------------------------------------------------------------
+fn bench_std_slotmap_get_single_threaded() {
+    let mut map = SlotMap::<DefaultKey, usize>::with_capacity(TOTAL_OPS);
+    let keys: Vec<_> = (0..TOTAL_OPS).map(|v| map.insert(v)).collect();
 
-fn bench_map_remove_contended() {
+    let start = Instant::now();
+    let hits = keys.iter().filter(|k| map.contains_key(**k)).count();
+    assert_eq!(hits, TOTAL_OPS);
+    report("SlotMap[1] single-threaded get", start.elapsed());
+}
+
+fn bench_std_slotmap_get_contended() {
     let chunk = TOTAL_OPS / THREADS;
-    let map = Arc::new(RwShardedHashMap::<usize, usize>::with_capacity(
-        16,
-        TOTAL_OPS,
-    ));
-    (0..TOTAL_OPS).for_each(|k| {
-        map.insert(k, k);
-    });
+    let mut map = SlotMap::<DefaultKey, usize>::with_capacity(TOTAL_OPS);
+    let keys: Vec<_> = (0..TOTAL_OPS).map(|v| map.insert(v)).collect();
+    let map = Arc::new(Mutex::new(map));
+    let keys = Arc::new(keys);
 
     let start = Instant::now();
     let handles: Vec<_> = (0..THREADS)
         .map(|t| {
             let m = Arc::clone(&map);
+            let keys = Arc::clone(&keys);
             thread::spawn(move || {
+                let mut hits = 0usize;
                 for i in 0..chunk {
-                    assert!(m.remove(&(t * chunk + i)).is_some());
+                    if m.lock().unwrap().contains_key(keys[t * chunk + i]) {
+                        hits += 1;
+                    }
                 }
+                hits
             })
         })
         .collect();
     for h in handles {
-        h.join().unwrap();
+        assert!(h.join().unwrap() > 0);
     }
     report(
-        &format!("RwShardedHashMap[16] {THREADS}-thread contended remove"),
+        &format!("SlotMap[1] {THREADS}-thread contended get"),
         start.elapsed(),
     );
 }
 
+// ---------------------------------------------------------------------------
+// Removals
+// ---------------------------------------------------------------------------
+
 fn bench_dlht_remove_contended() {
     let chunk = TOTAL_OPS / THREADS;
     let map = Arc::new(RwShardedDlhtMap::<usize, usize>::with_capacity(
-        16,
-        TOTAL_OPS,
+        16, TOTAL_OPS,
     ));
     (0..TOTAL_OPS).for_each(|k| {
         map.insert(k, k);
@@ -477,31 +460,213 @@ fn bench_slotmap_remove_contended() {
     );
 }
 
+fn bench_std_slotmap_remove_single_threaded() {
+    let mut map = SlotMap::<DefaultKey, usize>::with_capacity(TOTAL_OPS);
+    let keys: Vec<_> = (0..TOTAL_OPS).map(|v| map.insert(v)).collect();
+
+    let start = Instant::now();
+    for k in keys {
+        assert!(map.remove(k).is_some());
+    }
+    report("SlotMap[1] single-threaded remove", start.elapsed());
+}
+
+fn bench_std_slotmap_remove_contended() {
+    let chunk = TOTAL_OPS / THREADS;
+    let mut map = SlotMap::<DefaultKey, usize>::with_capacity(TOTAL_OPS);
+    let keys: Vec<_> = (0..TOTAL_OPS).map(|v| map.insert(v)).collect();
+    let map = Arc::new(Mutex::new(map));
+    let keys = Arc::new(keys);
+
+    let start = Instant::now();
+    let handles: Vec<_> = (0..THREADS)
+        .map(|t| {
+            let m = Arc::clone(&map);
+            let keys = Arc::clone(&keys);
+            thread::spawn(move || {
+                for i in 0..chunk {
+                    assert!(m.lock().unwrap().remove(keys[t * chunk + i]).is_some());
+                }
+            })
+        })
+        .collect();
+    for h in handles {
+        h.join().unwrap();
+    }
+    report(
+        &format!("SlotMap[1] {THREADS}-thread contended remove"),
+        start.elapsed(),
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Churn
+
+/// Sliding-window churn: each thread keeps a fixed-size ring of live keys and every
+/// iteration inserts one value and removes the oldest. Exercises free-list recycling
+/// under sustained mixed traffic; ops/sec counts inserts plus removals.
+const CHURN_WINDOW: usize = 1024;
+
+fn bench_slotmap_churn_contended() {
+    let chunk = TOTAL_OPS / THREADS;
+    let map = Arc::new(RwShardedSlotMap::<u64>::with_capacity(16, TOTAL_OPS));
+    let start = Instant::now();
+    let handles: Vec<_> = (0..THREADS)
+        .map(|t| {
+            let m = Arc::clone(&map);
+            thread::spawn(move || {
+                let mut ring: Vec<Option<SlotKey>> = vec![None; CHURN_WINDOW];
+                let mut ops = 0usize;
+                for i in 0..chunk {
+                    let slot = i % CHURN_WINDOW;
+                    if let Some(old) = ring[slot].take() {
+                        assert!(m.remove(old).is_some());
+                        ops += 1;
+                    }
+                    ring[slot] = Some(m.insert((t as u64) << 40 | i as u64));
+                    ops += 1;
+                }
+                for key in ring.into_iter().flatten() {
+                    assert!(m.remove(key).is_some());
+                }
+                ops
+            })
+        })
+        .collect();
+    let ops: usize = handles.into_iter().map(|h| h.join().unwrap()).sum();
+    assert!(map.is_empty());
+    report_ops(
+        &format!("RwShardedSlotMap[16] {THREADS}-thread churn"),
+        start.elapsed(),
+        ops,
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Heavy scale (50M ops, single-threaded)
+
+fn bench_heavy_std_slotmap_insert_single_threaded() {
+    let mut map = SlotMap::<DefaultKey, usize>::with_capacity(HEAVY_OPS);
+    let start = Instant::now();
+    for v in 0..HEAVY_OPS {
+        map.insert(v);
+    }
+    report_ops(
+        "SlotMap[1] single-threaded insert",
+        start.elapsed(),
+        HEAVY_OPS,
+    );
+}
+
+fn bench_heavy_sharded_slotmap_insert_single_threaded() {
+    let map = RwShardedSlotMap::<usize>::with_capacity(16, HEAVY_OPS);
+    let start = Instant::now();
+    for v in 0..HEAVY_OPS {
+        map.insert(v);
+    }
+    report_ops(
+        "RwShardedSlotMap[16] single-threaded insert",
+        start.elapsed(),
+        HEAVY_OPS,
+    );
+}
+
+fn bench_heavy_std_slotmap_get_single_threaded() {
+    let mut map = SlotMap::<DefaultKey, usize>::with_capacity(HEAVY_OPS);
+    let keys: Vec<_> = (0..HEAVY_OPS).map(|v| map.insert(v)).collect();
+
+    let start = Instant::now();
+    let hits = keys.iter().filter(|k| map.contains_key(**k)).count();
+    assert_eq!(hits, HEAVY_OPS);
+    report_ops("SlotMap[1] single-threaded get", start.elapsed(), HEAVY_OPS);
+}
+
+fn bench_heavy_sharded_slotmap_get_single_threaded() {
+    let map = RwShardedSlotMap::<usize>::with_capacity(16, HEAVY_OPS);
+    let keys: Vec<_> = (0..HEAVY_OPS).map(|v| map.insert(v)).collect();
+
+    let start = Instant::now();
+    let hits = keys.iter().filter(|k| map.contains(**k)).count();
+    assert_eq!(hits, HEAVY_OPS);
+    report_ops(
+        "RwShardedSlotMap[16] single-threaded get",
+        start.elapsed(),
+        HEAVY_OPS,
+    );
+}
+
+fn bench_heavy_std_slotmap_remove_single_threaded() {
+    let mut map = SlotMap::<DefaultKey, usize>::with_capacity(HEAVY_OPS);
+    let keys: Vec<_> = (0..HEAVY_OPS).map(|v| map.insert(v)).collect();
+
+    let start = Instant::now();
+    for k in keys {
+        assert!(map.remove(k).is_some());
+    }
+    report_ops(
+        "SlotMap[1] single-threaded remove",
+        start.elapsed(),
+        HEAVY_OPS,
+    );
+}
+
+fn bench_heavy_sharded_slotmap_remove_single_threaded() {
+    let map = RwShardedSlotMap::<usize>::with_capacity(16, HEAVY_OPS);
+    let keys: Vec<_> = (0..HEAVY_OPS).map(|v| map.insert(v)).collect();
+
+    let start = Instant::now();
+    for k in keys {
+        assert!(map.remove(k).is_some());
+    }
+    report_ops(
+        "RwShardedSlotMap[16] single-threaded remove",
+        start.elapsed(),
+        HEAVY_OPS,
+    );
+}
+
 fn main() {
     println!("{TOTAL_OPS} ops per benchmark");
 
     section("writes");
-    bench_map_insert_single_threaded();
-    bench_map_insert_contended();
     bench_dlht_insert_single_threaded();
     bench_dlht_insert_contended();
     bench_dashmap_insert_single_threaded();
     bench_dashmap_insert_contended();
     bench_slotmap_insert_single_threaded();
     bench_slotmap_insert_contended();
+    bench_std_slotmap_insert_single_threaded();
+    bench_std_slotmap_insert_contended();
     bench_collection_push_single_threaded();
     bench_collection_push_contended();
     bench_mutex_hashmap_insert_contended();
 
     section("reads");
-    bench_map_get_contended();
     bench_dlht_get_contended();
     bench_dashmap_get_contended();
     bench_slotmap_get_contended();
+    bench_std_slotmap_get_single_threaded();
+    bench_std_slotmap_get_contended();
 
     section("removals");
-    bench_map_remove_contended();
     bench_dlht_remove_contended();
     bench_dashmap_remove_contended();
     bench_slotmap_remove_contended();
+    bench_std_slotmap_remove_single_threaded();
+    bench_std_slotmap_remove_contended();
+
+    section("churn");
+    bench_slotmap_churn_contended();
+
+    section("heavy writes (50M)");
+    bench_heavy_std_slotmap_insert_single_threaded();
+    bench_heavy_sharded_slotmap_insert_single_threaded();
+
+    section("heavy reads (50M)");
+    bench_heavy_std_slotmap_get_single_threaded();
+    bench_heavy_sharded_slotmap_get_single_threaded();
+
+    section("heavy removals (50M)");
+    bench_heavy_std_slotmap_remove_single_threaded();
+    bench_heavy_sharded_slotmap_remove_single_threaded();
 }
