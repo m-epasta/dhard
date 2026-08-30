@@ -12,7 +12,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use crossbeam_utils::CachePadded;
 use parking_lot::RwLock;
-use slotmap::SlotMap;
+use slotmap::SlotMap as RawSlotMap;
 
 /// Picks the next shard for an insert via an atomic round-robin ticket
 #[inline]
@@ -64,7 +64,7 @@ impl fmt::Debug for SlotKey {
 /// NOTE: [`RwShardedSlotMap::len`] and [`RwShardedSlotMap::is_empty`] visit every
 /// shard, they are O(num_shards) rather than O(1).
 pub struct RwShardedSlotMap<V> {
-    shards: Vec<CachePadded<RwLock<SlotMap<slotmap::DefaultKey, V>>>>,
+    shards: Vec<CachePadded<RwLock<RawSlotMap<slotmap::DefaultKey, V>>>>,
     next_ticket: CachePadded<AtomicUsize>,
 }
 
@@ -82,7 +82,7 @@ impl<V> RwShardedSlotMap<V> {
             shards: (0..num_shards)
                 .map(|_| {
                     CachePadded::new(RwLock::new(
-                        SlotMap::<slotmap::DefaultKey, V>::with_capacity(per_shard),
+                        RawSlotMap::<slotmap::DefaultKey, V>::with_capacity(per_shard),
                     ))
                 })
                 .collect(),
@@ -162,6 +162,131 @@ impl<V> RwShardedSlotMap<V> {
 }
 
 impl<V> Default for RwShardedSlotMap<V> {
+    fn default() -> Self {
+        Self::new(32)
+    }
+}
+
+/// A single-threaded sharded slot map: each shard is a `slotmap` arena with **no**
+/// locking and **no** atomics.
+///
+/// This is the lock-free cousin of [`RwShardedSlotMap`]: both distribute values
+/// round-robin across `num_shards` independent arenas and mint stable [`SlotKey`]
+/// handles carrying the owning shard. Unlike [`RwShardedSlotMap`], this type performs
+/// **no** synchronization at all — it is single-threaded by construction and taken
+/// by `&mut self` wherever it mutates — so it is an order of magnitude faster when
+/// used from one thread.
+///
+/// Sharding across multiple arenas does not by itself make a single thread faster
+/// (there is no lock contention to spread), so you will typically see the best
+/// throughput with a small shard count; the sharded form remains useful as a
+/// building block and keeps the same key/handle shape as [`RwShardedSlotMap`].
+///
+/// Because there are no locks, methods can return **borrowed references**
+/// ([`ShardedSlotMap::get`] / [`ShardedSlotMap::get_mut`]) to stored values, a
+/// capability that the lock-protected [`RwShardedSlotMap`] cannot offer.
+///
+/// Under the hood each shard reuses the battle-tested
+/// [`slotmap`](https://docs.rs/slotmap) arena, so there is no hand-rolled reimplementation
+/// to maintain.
+pub struct ShardedSlotMap<V> {
+    shards: Vec<RawSlotMap<slotmap::DefaultKey, V>>,
+    next_ticket: usize,
+}
+
+impl<V> ShardedSlotMap<V> {
+    /// Creates a new [`ShardedSlotMap`] with `num_shards` empty shards
+    pub fn new(num_shards: usize) -> Self {
+        Self::with_capacity(num_shards, 0)
+    }
+
+    /// Creates a new [`ShardedSlotMap`] with `num_shards` shards, pre-allocating space
+    /// for about `capacity_hint` items in total
+    pub fn with_capacity(num_shards: usize, capacity_hint: usize) -> Self {
+        let per_shard = capacity_hint.checked_div(num_shards).unwrap_or(0);
+        Self {
+            shards: (0..num_shards)
+                .map(|_| RawSlotMap::<slotmap::DefaultKey, V>::with_capacity(per_shard))
+                .collect(),
+            next_ticket: 0,
+        }
+    }
+
+    /// Returns the number of shards
+    #[inline]
+    pub fn num_shards(&self) -> usize {
+        self.shards.len()
+    }
+
+    /// Returns the total number of live values across all shards
+    pub fn len(&self) -> usize {
+        self.shards.iter().map(|shard| shard.len()).sum()
+    }
+
+    /// Returns whether or not the map holds no values
+    pub fn is_empty(&self) -> bool {
+        self.shards.iter().all(|shard| shard.is_empty())
+    }
+
+    /// Inserts a value into the map and returns its stable [`SlotKey`]
+    ///
+    /// # Panics
+    /// Panics if the map was created with zero shards.
+    #[inline]
+    pub fn insert(&mut self, value: V) -> SlotKey {
+        let shard_idx = if self.shards.is_empty() {
+            panic!("slot map must have at least one shard");
+        } else if self.shards.len().is_power_of_two() {
+            self.next_ticket & (self.shards.len() - 1)
+        } else {
+            self.next_ticket % self.shards.len()
+        };
+        self.next_ticket += 1;
+        let inner = self.shards[shard_idx].insert(value);
+        SlotKey {
+            shard: shard_idx as u32,
+            inner,
+        }
+    }
+
+    /// Returns a reference to the value behind `key`, if it is still live
+    #[inline]
+    pub fn get(&self, key: SlotKey) -> Option<&V> {
+        self.shards.get(key.shard as usize)?.get(key.inner)
+    }
+
+    /// Returns a mutable reference to the value behind `key`, if it is still live
+    #[inline]
+    pub fn get_mut(&mut self, key: SlotKey) -> Option<&mut V> {
+        self.shards.get_mut(key.shard as usize)?.get_mut(key.inner)
+    }
+
+    /// Returns a clone of the value behind `key`, if it is still live
+    pub fn get_cloned(&self, key: SlotKey) -> Option<V>
+    where
+        V: Clone,
+    {
+        self.get(key).cloned()
+    }
+
+    /// Returns whether or not `key` still points to a live value
+    #[inline]
+    pub fn contains(&self, key: SlotKey) -> bool {
+        self.shards
+            .get(key.shard as usize)
+            .is_some_and(|shard| shard.contains_key(key.inner))
+    }
+
+    /// Removes the value behind `key`, returning it if the key was live.
+    /// The slot becomes reusable by later inserts; using `key` afterwards returns
+    /// `None`
+    #[inline]
+    pub fn remove(&mut self, key: SlotKey) -> Option<V> {
+        self.shards.get_mut(key.shard as usize)?.remove(key.inner)
+    }
+}
+
+impl<V> Default for ShardedSlotMap<V> {
     fn default() -> Self {
         Self::new(32)
     }
@@ -298,5 +423,107 @@ mod tests {
         let map: RwShardedSlotMap<u8> = RwShardedSlotMap::default();
         assert_eq!(map.num_shards(), 32);
         assert!(map.is_empty());
+    }
+
+    #[test]
+    fn test_sharded_slotmap_insert_get_cloned_remove() {
+        let mut map = ShardedSlotMap::<String>::with_capacity(4, 8);
+        assert!(map.is_empty());
+
+        let k1 = map.insert("one".to_string());
+        let k2 = map.insert("two".to_string());
+        assert_eq!(map.len(), 2);
+
+        assert_eq!(map.get_cloned(k1), Some("one".to_string()));
+        assert!(map.contains(k1));
+        assert_eq!(map.remove(k1), Some("one".to_string()));
+
+        assert_eq!(map.get_cloned(k1), None);
+        assert!(!map.contains(k1));
+        assert_eq!(map.remove(k1), None);
+        assert_eq!(map.len(), 1);
+
+        let recycled = map.insert("three".to_string());
+        assert_ne!(recycled, k1);
+        assert_eq!(map.get_cloned(recycled), Some("three".to_string()));
+        assert_eq!(map.get_cloned(k2), Some("two".to_string()));
+    }
+
+    #[test]
+    fn test_sharded_slotmap_returns_references() {
+        let mut map = ShardedSlotMap::<u32>::with_capacity(4, 4);
+
+        let k1 = map.insert(10);
+        let k2 = map.insert(20);
+
+        assert_eq!(map.get(k1), Some(&10));
+        assert_eq!(map.get(k2), Some(&20));
+
+        if let Some(v) = map.get_mut(k1) {
+            *v += 5;
+        }
+        assert_eq!(map.get(k1), Some(&15));
+        assert_eq!(map.get_cloned(k2), Some(20));
+
+        let k3 = map.insert(99);
+        assert_eq!(map.get_mut(k3), Some(&mut 99));
+    }
+
+    #[test]
+    fn test_sharded_slotmap_stale_key_after_remove() {
+        let mut map = ShardedSlotMap::<usize>::new(1);
+        let key = map.insert(1);
+        assert_eq!(map.remove(key), Some(1));
+        assert_eq!(map.get(key), None);
+        assert_eq!(map.get_mut(key), None);
+
+        let recycled = map.insert(2);
+        assert_ne!(recycled, key);
+        assert_eq!(map.get(recycled), Some(&2));
+        assert_eq!(map.get(key), None);
+    }
+
+    #[test]
+    fn test_sharded_slotmap_churn_keeps_memory_bounded() {
+        let mut map = ShardedSlotMap::<usize>::with_capacity(4, 64);
+        for round in 0..10 {
+            let keys: Vec<SlotKey> = (0..100).map(|v| map.insert(v + round)).collect();
+            assert_eq!(map.len(), 100);
+            for (i, key) in keys.iter().enumerate() {
+                assert_eq!(map.get_cloned(*key), Some(i + round));
+            }
+            for key in keys {
+                assert!(map.remove(key).is_some());
+            }
+            assert!(map.is_empty());
+        }
+    }
+
+    #[test]
+    fn test_sharded_slotmap_keys_resolve_across_shards() {
+        let mut map = ShardedSlotMap::<u64>::new(4);
+        let mut keys = Vec::new();
+        for i in 0..100u64 {
+            keys.push(map.insert(i));
+        }
+        assert_eq!(map.len(), 100);
+        assert!(
+            keys.iter()
+                .map(|k| k.shard())
+                .collect::<std::collections::HashSet<_>>()
+                .len()
+                > 1
+        );
+        for (i, key) in keys.iter().enumerate() {
+            assert_eq!(map.get_cloned(*key), Some(i as u64));
+        }
+    }
+
+    #[test]
+    fn test_sharded_slotmap_default_has_shards() {
+        let map: ShardedSlotMap<u8> = ShardedSlotMap::default();
+        assert_eq!(map.num_shards(), 32);
+        assert!(map.is_empty());
+        assert_eq!(map.len(), 0);
     }
 }

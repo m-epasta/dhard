@@ -2,120 +2,68 @@
 //!
 //! Data structures and traits for sharding data in memory and persisting shards to disk.
 //!
-//! The core type is [`ShardCollection`]: a fixed set of [`Shard`]s, each guarding its own
-//! items behind a [`parking_lot::RwLock`]. Items are distributed
-//! round-robin at push time, so concurrent writers mostly contend on different locks.
-//! Items are never removed, hence every index returned by a push stays valid for the
-//! whole lifetime of the collection.
+//! The crate ships two layers:
 //!
-//! ## Quick start
+//! - **Persistence**: expressed through the [`Writable`], [`Readable`] and `ShardFormat`
+//!   traits: implement them for your types to serialize shards onto any
+//!   [`std::io::Write`]/[`std::io::Read`] sink, with `ShardWriter` and `ShardReader` as
+//!   the driving handles. Always available, even with `--no-default-features`.
+//! - **Sharding primitives** (default `multithreaded` feature): `ShardCollection`
+//!   distributes items round-robin across cache-line-padded shards, each guarding its
+//!   own items behind a `parking_lot::RwLock`. Items are distributed round-robin at
+//!   push time, so concurrent writers mostly contend on different locks; every index
+//!   returned by a push stays valid for the whole lifetime of the collection.
 //!
-//! ```
-//! use dhard::ShardCollection;
+//! On top of the same sharding pattern, the feature also enables two concurrent
+//! *slot* maps — each occupies a different point of the trade-off space, and both are
+//! covered by the benchmark suite (`cargo bench --bench throughput`):
 //!
-//! let collection: ShardCollection<u32> = ShardCollection::new(4);
-//!
-//! let (shard_idx, item_idx) = collection.push(42).expect("collection has shards");
-//! let item = collection
-//!     .get_shard(shard_idx)
-//!     .and_then(|shard| shard.get_cloned(item_idx));
-//!
-//! assert_eq!(item, Some(42));
-//! ```
-//!
-//! ## Custom sharding logic
-//!
-//! Implement [`ShardExt`] to define how a piece of data is divided into shards.
-//! The number of shards is derived from a threshold of max items per shard, which
-//! defaults to [`ShardExt::THRESHOLD`] and can be overridden per call via
-//! [`ShardExt::shard_with`].
-//!
-//! ```
-//! use std::collections::HashMap;
-//! use std::hash::Hash;
-//!
-//! use dhard::{ShardCollection, ShardExt};
-//!
-//! struct Chunked<K, V>(HashMap<K, V>);
-//!
-//! impl<K, V> ShardExt<HashMap<K, V>> for Chunked<K, V>
-//! where
-//!     K: Clone + Eq + Hash,
-//!     V: Clone,
-//! {
-//!     type Item = (K, V);
-//!
-//!     fn shard_with(data: &HashMap<K, V>, threshold: usize) -> ShardCollection<(K, V)> {
-//!         let num_shards = data.len().div_ceil(threshold.max(1)).max(1);
-//!         let shards = ShardCollection::new(num_shards);
-//!         for (k, v) in data {
-//!             shards.push((k.clone(), v.clone()));
-//!         }
-//!         shards
-//!     }
-//! }
-//!
-//! let map: HashMap<u32, u32> = (0..100).map(|i| (i, i)).collect();
-//! let shards = Chunked::shard(&map);
-//!
-//! assert_eq!(shards.len(), 100);
-//! assert!(shards.num_shards() > 1);
-//! ```
-//!
-//! ## Persistence
-//!
-//! Disk persistence is expressed through the [`Writable`], [`Readable`] and
-//! [`ShardFormat`] traits: implement them for your types to serialize shards onto
-//! any [`std::io::Write`]/[`std::io::Read`] sink, with [`ShardWriter`] and
-//! [`ShardReader`] as the driving handles.
-//!
-//! ## Data structures
-//!
-//! Beyond the primitives, dhard ships three concurrent structures built on the same
-//! sharding pattern — each occupies a different point of the trade-off space, and all
-//! are covered by the benchmark suite (`cargo bench --bench throughput`):
-//!
-//! - [`RwShardedDlhtMap`] is the read/delete specialist: fingerprints in cache-line-
-//!   chained bins point into a side arena, hashing each key once and touching a single
-//!   cache line on most lookups. Fastest keyed lookups and removals, at the cost of
-//!   roughly half-speed inserts. Design inspired by DLHT (HPDC'24,
-//!   <https://arxiv.org/abs/2406.09986>).
-//! - [`RwShardedSlotMap`] mints stable [`SlotKey`] handles at insert time
+//! - `RwShardedSlotMap` mints stable `SlotKey` handles at insert time
 //!   (shard + generational slot): O(1) lookups and removals without any hashing, and
-//!   the fastest structure in the crate overall — provided deletions can present the
-//!   stored handle rather than an arbitrary key. Each shard is a battle-tested
-//!   [`slotmap`](https://docs.rs/slotmap) arena.
+//!   the fastest *concurrent* structure in the crate overall — provided deletions can
+//!   present the stored handle rather than an arbitrary key. Each shard is a
+//!   battle-tested [`slotmap`](https://docs.rs/slotmap) arena.
+//! - `ShardedSlotMap` is a single-threaded sharded slot map: same round-robin
+//!   sharding and `SlotKey` handles as `RwShardedSlotMap`, but with **no** locks and
+//!   **no** atomics. Used from a single thread it runs an order of magnitude faster
+//!   than the sharded, locked variant, and — uniquely in this crate — returns borrowed
+//!   `&V`/`&mut V` references instead of only clones.
 //!
 //! ## Choosing a structure
 //!
 //! | You need | Use |
 //! |---|---|
-//! | Keyed access, not heavy workload | [`RwShardedDlhtMap`] |
-//! | Stable handles, O(1) remove, zero hashing | [`RwShardedSlotMap`] |
-//! | Maximum raw append throughput | [`ShardCollection`] |
-//! | Single-threaded keyed storage | `slotmap::SlotMap` |
+//! | Stable handles, O(1) remove, zero hashing, concurrent | `RwShardedSlotMap` |
+//! | Stable handles, O(1) remove, zero hashing, single-threaded | `ShardedSlotMap` |
+//! | Maximum raw append throughput | `ShardCollection` |
+//! | Single-threaded keyed storage (bare arena) | `slotmap::SlotMap` |
 //!
 //! The sharded structures pay for their concurrency with per-operation locking:
-//! single-threaded code is better served by the standard library.
+//! single-threaded code is better served by the crate's own [`ShardedSlotMap`], which
+//! drops the locks entirely.
 
 use std::{
     error::Error,
     io::{Read, Write},
     marker::PhantomData,
+};
+
+#[cfg(feature = "multithreaded")]
+use std::{
     ops::{Deref, DerefMut},
     sync::atomic::{AtomicUsize, Ordering},
 };
 
+#[cfg(feature = "multithreaded")]
 use crossbeam_utils::CachePadded;
+#[cfg(feature = "multithreaded")]
 use parking_lot::{RwLock, RwLockReadGuard, RwLockWriteGuard};
 
-pub mod dlht_map;
+#[cfg(feature = "multithreaded")]
 pub mod slot_map;
 
-mod hashing;
-
-pub use dlht_map::RwShardedDlhtMap;
-pub use slot_map::{RwShardedSlotMap, SlotKey};
+#[cfg(feature = "multithreaded")]
+pub use slot_map::{RwShardedSlotMap, ShardedSlotMap, SlotKey};
 
 /// A collection of [`Shard`]s that distributes items across multiple shards
 ///
@@ -124,12 +72,29 @@ pub use slot_map::{RwShardedSlotMap, SlotKey};
 ///
 /// Shards and the round-robin counter are cache-line padded ([`crossbeam_utils::CachePadded`])
 /// so that concurrently accessed shards do not invalidate each other's cache lines.
+///
+/// # Quick start
+///
+/// ```
+/// use dhard::ShardCollection;
+///
+/// let collection: ShardCollection<u32> = ShardCollection::new(4);
+///
+/// let (shard_idx, item_idx) = collection.push(42).expect("collection has shards");
+/// let item = collection
+///     .get_shard(shard_idx)
+///     .and_then(|shard| shard.get_cloned(item_idx));
+///
+/// assert_eq!(item, Some(42));
+/// ```
+#[cfg(feature = "multithreaded")]
 pub struct ShardCollection<V> {
     shards: Vec<CachePadded<Shard<V>>>,
     rr_counter: CachePadded<AtomicUsize>,
 }
 
 /// A single shard containing items `V` behind a [`parking_lot::RwLock`]
+#[cfg(feature = "multithreaded")]
 pub struct Shard<V> {
     items: RwLock<Vec<V>>,
     items_count: AtomicUsize,
@@ -141,6 +106,7 @@ pub struct Shard<V> {
 /// NOTE: Like its inner guard, this type is `!Send` by default (see parking_lot's
 /// `send_guard` feature) but implements [`Sync`], so it can be shared across threads
 /// by reference. It implements [`Deref`] for direct access to the item.
+#[cfg(feature = "multithreaded")]
 pub struct ShardRef<'a, V> {
     guard: RwLockReadGuard<'a, Vec<V>>,
     idx: usize,
@@ -153,12 +119,14 @@ pub struct ShardRef<'a, V> {
 /// NOTE: Like its inner guard, this type is `!Send` by default (see parking_lot's
 /// `send_guard` feature) but implements [`Sync`], so it can be shared across threads
 /// by reference. It implements [`Deref`] and [`DerefMut`] for direct access to the item.
+#[cfg(feature = "multithreaded")]
 pub struct ShardMutRef<'a, V> {
     guard: Option<RwLockWriteGuard<'a, Vec<V>>>,
     idx: usize,
 }
 
 /// [`ShardWriter`] is a public interface for writing to disk your [`Shard`]s
+#[cfg(feature = "multithreaded")]
 #[allow(dead_code)]
 pub struct ShardWriter<W, D, E> {
     writer: W,
@@ -170,6 +138,7 @@ pub struct ShardWriter<W, D, E> {
 
 /// [`ShardReader`] is a public interface for reading
 /// your [`Shard`]s that have been written with [`ShardWriter`] to disk
+#[cfg(feature = "multithreaded")]
 #[allow(dead_code)]
 pub struct ShardReader<R, D, E> {
     reader: R,
@@ -182,6 +151,45 @@ pub struct ShardReader<R, D, E> {
 /// [`ShardExt`] is a public interface where you can define
 /// the sharding logic of your `Shard<YourType>`. The only constraint
 /// is that you have to collect the shards into a [`ShardCollection`]
+///
+/// The number of shards is derived from a threshold of max items per shard, which
+/// defaults to [`ShardExt::THRESHOLD`] and can be overridden per call via
+/// [`ShardExt::shard_with`].
+///
+/// # Custom sharding logic
+///
+/// ```
+/// use std::collections::HashMap;
+/// use std::hash::Hash;
+///
+/// use dhard::{ShardCollection, ShardExt};
+///
+/// struct Chunked<K, V>(HashMap<K, V>);
+///
+/// impl<K, V> ShardExt<HashMap<K, V>> for Chunked<K, V>
+/// where
+///     K: Clone + Eq + Hash,
+///     V: Clone,
+/// {
+///     type Item = (K, V);
+///
+///     fn shard_with(data: &HashMap<K, V>, threshold: usize) -> ShardCollection<(K, V)> {
+///         let num_shards = data.len().div_ceil(threshold.max(1)).max(1);
+///         let shards = ShardCollection::new(num_shards);
+///         for (k, v) in data {
+///             shards.push((k.clone(), v.clone()));
+///         }
+///         shards
+///     }
+/// }
+///
+/// let map: HashMap<u32, u32> = (0..100).map(|i| (i, i)).collect();
+/// let shards = Chunked::shard(&map);
+///
+/// assert_eq!(shards.len(), 100);
+/// assert!(shards.num_shards() > 1);
+/// ```
+#[cfg(feature = "multithreaded")]
 pub trait ShardExt<D: ?Sized> {
     /// The item type stored inside each shard.
     type Item;
@@ -216,11 +224,13 @@ pub trait Readable: Sized {
 
 /// This trait permits you to validate via [`Writable`] and [`Readable`] the possibility
 /// of writing to file your shards. Do prefer this trait for writing and reading your shards
+#[cfg(feature = "multithreaded")]
 pub trait ShardFormat<W: Write, D, E: Error> {
     fn write_shard<V: Writable<Error = E>>(&mut self, shard: &Shard<V>) -> Result<(), E>;
     fn read_shard<V: Readable<Error = E>>(&mut self) -> Result<Shard<V>, E>;
 }
 
+#[cfg(feature = "multithreaded")]
 impl<V> ShardCollection<V> {
     /// Creates a new [`ShardCollection`] with `num_shards` empty shards
     pub fn new(num_shards: usize) -> Self {
@@ -329,12 +339,14 @@ impl<V> ShardCollection<V> {
     }
 }
 
+#[cfg(feature = "multithreaded")]
 impl<V> Default for ShardCollection<V> {
     fn default() -> Self {
         Self::new(1)
     }
 }
 
+#[cfg(feature = "multithreaded")]
 impl<V> Shard<V> {
     /// Creates a new [`Shard`]
     pub const fn new() -> Self {
@@ -462,12 +474,14 @@ impl<V> Shard<V> {
     }
 }
 
+#[cfg(feature = "multithreaded")]
 impl<V> Default for Shard<V> {
     fn default() -> Self {
         Self::new()
     }
 }
 
+#[cfg(feature = "multithreaded")]
 impl<'a, V> ShardRef<'a, V> {
     fn new(guard: RwLockReadGuard<'a, Vec<V>>, idx: usize) -> Option<Self> {
         if idx < guard.len() {
@@ -484,6 +498,7 @@ impl<'a, V> ShardRef<'a, V> {
     }
 }
 
+#[cfg(feature = "multithreaded")]
 impl<V> Deref for ShardRef<'_, V> {
     type Target = V;
 
@@ -493,6 +508,7 @@ impl<V> Deref for ShardRef<'_, V> {
     }
 }
 
+#[cfg(feature = "multithreaded")]
 impl<'a, V> ShardMutRef<'a, V> {
     fn new(guard: RwLockWriteGuard<'a, Vec<V>>, idx: usize) -> Option<Self> {
         if idx < guard.len() {
@@ -521,6 +537,7 @@ impl<'a, V> ShardMutRef<'a, V> {
     }
 }
 
+#[cfg(feature = "multithreaded")]
 impl<V> Deref for ShardMutRef<'_, V> {
     type Target = V;
 
@@ -530,6 +547,7 @@ impl<V> Deref for ShardMutRef<'_, V> {
     }
 }
 
+#[cfg(feature = "multithreaded")]
 impl<V> DerefMut for ShardMutRef<'_, V> {
     #[inline]
     fn deref_mut(&mut self) -> &mut V {
@@ -537,5 +555,5 @@ impl<V> DerefMut for ShardMutRef<'_, V> {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "multithreaded"))]
 mod tests;
