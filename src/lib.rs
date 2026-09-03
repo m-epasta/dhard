@@ -125,9 +125,17 @@ pub struct ShardMutRef<'a, V> {
     idx: usize,
 }
 
-/// [`ShardWriter`] is a public interface for writing to disk your [`Shard`]s
+/// [`ShardWriter`] is a public interface for writing to disk your [`Shard`]s.
+///
+/// It is generic over:
+/// - `W`: the [`std::io::Write`] sink (file, buffer, socket, ...),
+/// - `D`: an arbitrary data/config payload that [`ShardFormat`] can inspect,
+/// - `E`: the [`std::error::Error`] type produced by items [`Writable`] on their
+///   way out.
+///
+/// The writer tracks the total number of bytes written so far in
+/// [`ShardWriter::data_size`].
 #[cfg(feature = "multithreaded")]
-#[allow(dead_code)]
 pub struct ShardWriter<W, D, E> {
     writer: W,
     data_size: u64,
@@ -137,15 +145,104 @@ pub struct ShardWriter<W, D, E> {
 }
 
 /// [`ShardReader`] is a public interface for reading
-/// your [`Shard`]s that have been written with [`ShardWriter`] to disk
+/// your [`Shard`]s that have been written with [`ShardWriter`] to disk.
+///
+/// It is generic over:
+/// - `R`: the [`std::io::Read`] source,
+/// - `D`: an arbitrary data/config payload that [`ShardFormat`] can inspect,
+/// - `E`: the [`std::error::Error`] type produced by items [`Readable`] on their
+///   way in.
+///
+/// The reader tracks the total number of bytes it has consumed in
+/// [`ShardReader::data_size`].
 #[cfg(feature = "multithreaded")]
-#[allow(dead_code)]
 pub struct ShardReader<R, D, E> {
     reader: R,
     data_size: u64,
     data: D,
     checksum: u64,
     _e: PhantomData<E>,
+}
+
+#[cfg(feature = "multithreaded")]
+impl<W: Write, D, E> ShardWriter<W, D, E> {
+    /// Create a new [`ShardWriter`] over `writer`, carrying a copy of `data`
+    /// so [`ShardFormat`] implementations (and callers) can adjust behaviour
+    /// per format.
+    pub fn new(writer: W, data: D) -> Self {
+        Self {
+            writer,
+            data_size: 0,
+            data,
+            checksum: 0,
+            _e: PhantomData,
+        }
+    }
+
+    /// Immutable access to the underlying `data` payload.
+    pub fn data(&self) -> &D {
+        &self.data
+    }
+
+    /// Mutable access to the underlying `data` payload.
+    pub fn data_mut(&mut self) -> &mut D {
+        &mut self.data
+    }
+
+    /// Total number of bytes written so far.
+    pub fn data_size(&self) -> u64 {
+        self.data_size
+    }
+
+    /// The running checksum (currently reserved for format-specific use).
+    pub fn checksum(&self) -> u64 {
+        self.checksum
+    }
+
+    /// Consume the writer, returning the wrapped [`std::io::Write`] sink.
+    pub fn into_writer(self) -> W {
+        self.writer
+    }
+}
+
+#[cfg(feature = "multithreaded")]
+impl<R: Read, D, E> ShardReader<R, D, E> {
+    /// Create a new [`ShardReader`] over `reader`, carrying a copy of `data`
+    /// so [`ShardFormat`] implementations can adjust behaviour per format.
+    pub fn new(reader: R, data: D) -> Self {
+        Self {
+            reader,
+            data_size: 0,
+            data,
+            checksum: 0,
+            _e: PhantomData,
+        }
+    }
+
+    /// Immutable access to the underlying `data` payload.
+    pub fn data(&self) -> &D {
+        &self.data
+    }
+
+    /// Mutable access to the underlying `data` payload.
+    pub fn data_mut(&mut self) -> &mut D {
+        &mut self.data
+    }
+
+    /// Total number of bytes read so far.
+    pub fn data_size(&self) -> u64 {
+        self.data_size
+    }
+
+    /// The running checksum (currently reserved for format-specific use).
+    pub fn checksum(&self) -> u64 {
+        self.checksum
+    }
+
+    /// Consume the reader, returning the wrapped [`std::io::Read`] source.
+    pub fn into_reader(self) -> R {
+        self.reader
+    }
 }
 
 /// [`ShardExt`] is a public interface where you can define
@@ -208,11 +305,15 @@ pub trait ShardExt<D: ?Sized> {
 }
 
 /// This trait permits you to implement a general write logic into any [`std::io::Write`] sink
-/// (files, sockets, buffers, ...)
+/// (files, sockets, buffers, ...).
+///
+/// `write_to` takes `&self` so that items living inside a
+/// [`Shard`], which are read-guarded behind a `parking_lot` RwLock, can be
+/// written out without needing exclusive mutable access.
 pub trait Writable {
     type Error;
 
-    fn write_to<W: Write>(&mut self, writer: &mut W) -> Result<u64, Self::Error>;
+    fn write_to<W: Write>(&self, writer: &mut W) -> Result<u64, Self::Error>;
 }
 
 /// This trait permits you to implement a general read logic over any Sized type
@@ -222,12 +323,53 @@ pub trait Readable: Sized {
     fn read_from<R: Read>(reader: &mut R) -> Result<Self, Self::Error>;
 }
 
-/// This trait permits you to validate via [`Writable`] and [`Readable`] the possibility
-/// of writing to file your shards. Do prefer this trait for writing and reading your shards
+/// This trait permits you to validate via [`Writable`] the possibility of writing
+/// a whole [`Shard<V>`] to a [`std::io::Write`] sink. The default
+/// implementation is provided for [`ShardWriter`]; implement it on your own
+/// types to layer header/footer or per-format framing around the body.
 #[cfg(feature = "multithreaded")]
-pub trait ShardFormat<W: Write, D, E: Error> {
+pub trait ShardWriteFormat<W: Write, D, E: Error> {
     fn write_shard<V: Writable<Error = E>>(&mut self, shard: &Shard<V>) -> Result<(), E>;
-    fn read_shard<V: Readable<Error = E>>(&mut self) -> Result<Shard<V>, E>;
+}
+
+/// This trait permits you to validate via [`Readable`] the possibility of reading
+/// a whole [`Shard<V>`] from a [`std::io::Read`] source. The default
+/// implementation is provided for [`ShardReader`]; implement it on your own
+/// types to layer header/footer or per-format framing around the body.
+#[cfg(feature = "multithreaded")]
+pub trait ShardReadFormat<R: Read> {
+    fn read_shard<V: Readable>(&mut self, count: usize) -> Result<Shard<V>, V::Error>;
+}
+
+/// The default [`ShardFormat`] implementation behind [`ShardWriter`]: writes
+/// every item of a [`Shard<V>`] sequentially (in index order) via
+/// [`Writable::write_to`], accumulating the total byte count into
+/// [`ShardWriter::data_size`].
+#[cfg(feature = "multithreaded")]
+impl<W: Write, D, E: Error> ShardWriteFormat<W, D, E> for ShardWriter<W, D, E> {
+    fn write_shard<V: Writable<Error = E>>(&mut self, shard: &Shard<V>) -> Result<(), E> {
+        let items = shard.items();
+        for item in items.iter() {
+            let n = item.write_to(&mut self.writer)?;
+            self.data_size = self.data_size.wrapping_add(n);
+        }
+        Ok(())
+    }
+}
+
+/// The default [`ShardReadFormat`] implementation behind [`ShardReader`]: reads
+/// exactly `count` items sequentially (in index order) via [`Readable::read_from`],
+/// reconstructing a [`Shard<V>`].
+#[cfg(feature = "multithreaded")]
+impl<R: Read, D, E> ShardReadFormat<R> for ShardReader<R, D, E> {
+    fn read_shard<V: Readable>(&mut self, count: usize) -> Result<Shard<V>, V::Error> {
+        let shard = Shard::with_capacity(count);
+        for _ in 0..count {
+            let item = V::read_from(&mut self.reader)?;
+            shard.push(item);
+        }
+        Ok(shard)
+    }
 }
 
 #[cfg(feature = "multithreaded")]

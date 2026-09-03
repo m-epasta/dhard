@@ -15,6 +15,40 @@ fn make_item(id: u32, name: &str) -> TestData {
     }
 }
 
+impl Writable for TestData {
+    type Error = std::io::Error;
+
+    fn write_to<W: Write>(&self, writer: &mut W) -> Result<u64, Self::Error> {
+        let name = self.name.as_bytes();
+        let mut n = 0u64;
+        writer.write_all(&self.id.to_le_bytes())?;
+        n += 4;
+        writer.write_all(&(name.len() as u32).to_le_bytes())?;
+        n += 4;
+        writer.write_all(name)?;
+        n += name.len() as u64;
+        Ok(n)
+    }
+}
+
+impl Readable for TestData {
+    type Error = std::io::Error;
+
+    fn read_from<R: Read>(reader: &mut R) -> Result<Self, Self::Error> {
+        let mut id = [0u8; 4];
+        reader.read_exact(&mut id)?;
+        let mut len = [0u8; 4];
+        reader.read_exact(&mut len)?;
+        let len = u32::from_le_bytes(len) as usize;
+        let mut name = vec![0u8; len];
+        reader.read_exact(&mut name)?;
+        Ok(Self {
+            id: u32::from_le_bytes(id),
+            name: String::from_utf8_lossy(&name).into_owned(),
+        })
+    }
+}
+
 #[test]
 fn test_new_is_empty() {
     let shard = TestShard::new();
@@ -775,4 +809,87 @@ fn test_collection_extend_edges() {
 
     collection.extend(0..3);
     assert_eq!(collection.len(), 3);
+}
+
+#[test]
+fn test_shard_writer_writes_shard() {
+    let shard = TestShard::new();
+    shard.push(make_item(1, "a"));
+    shard.push(make_item(2, "bb"));
+    shard.push(make_item(3, "ccc"));
+
+    let mut buf = Vec::new();
+    let mut writer: ShardWriter<_, (), _> = ShardWriter::new(&mut buf, ());
+    writer.write_shard(&shard).unwrap();
+    {
+        let _x = writer;
+    };
+
+    // 3 items * (4 id + 4 len + name)
+    assert_eq!(buf.len(), 4 + 4 + 1 + 4 + 4 + 2 + 4 + 4 + 3);
+}
+
+#[test]
+fn test_shard_reader_reads_shard_back() {
+    let shard = TestShard::new();
+    shard.push(make_item(1, "a"));
+    shard.push(make_item(2, "bb"));
+    shard.push(make_item(3, "ccc"));
+
+    let mut buf = Vec::new();
+    {
+        let mut writer: ShardWriter<_, (), _> = ShardWriter::new(&mut buf, ());
+        writer.write_shard(&shard).unwrap();
+    }
+
+    let mut cursor = std::io::Cursor::new(buf);
+    let mut reader: ShardReader<_, (), TestData> = ShardReader::new(&mut cursor, ());
+    let restored = reader.read_shard::<TestData>(3).unwrap();
+
+    assert_eq!(restored.len(), 3);
+    assert_eq!(restored.get_cloned(0).unwrap(), make_item(1, "a"));
+    assert_eq!(restored.get_cloned(1).unwrap(), make_item(2, "bb"));
+    assert_eq!(restored.get_cloned(2).unwrap(), make_item(3, "ccc"));
+}
+
+#[test]
+fn test_shard_reader_with_count() {
+    let shard = TestShard::new();
+    shard.push(make_item(1, "x"));
+    shard.push(make_item(2, "y"));
+
+    let mut buf = Vec::new();
+    {
+        let mut writer: ShardWriter<_, (), _> = ShardWriter::new(&mut buf, ());
+        writer.write_shard(&shard).unwrap();
+    }
+
+    // Reading fewer than written yields the first N items only.
+    let mut cursor = std::io::Cursor::new(buf);
+    let mut reader: ShardReader<_, (), TestData> = ShardReader::new(&mut cursor, ());
+    let partial = reader.read_shard::<TestData>(1).unwrap();
+    assert_eq!(partial.len(), 1);
+    assert_eq!(partial.get_cloned(0).unwrap(), make_item(1, "x"));
+}
+
+#[test]
+fn test_shard_writer_tracks_data_size() {
+    let shard = TestShard::new();
+    shard.push(make_item(1, "a"));
+
+    let mut buf = Vec::new();
+    let mut writer: ShardWriter<_, (), _> = ShardWriter::new(&mut buf, ());
+    assert_eq!(writer.data_size(), 0);
+    writer.write_shard(&shard).unwrap();
+    assert_eq!(writer.data_size(), 9); // 4 + 4 + 1
+}
+
+#[test]
+fn test_shard_writer_config_payload() {
+    // The D payload rides along and is accessible to the format.
+    let mut buf = Vec::new();
+    let mut writer: ShardWriter<_, u32, std::io::Error> = ShardWriter::new(&mut buf, 7);
+    assert_eq!(*writer.data(), 7);
+    *writer.data_mut() = 9;
+    assert_eq!(*writer.data(), 9);
 }
